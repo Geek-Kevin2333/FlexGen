@@ -133,7 +133,7 @@ def init_weight_list(weight_specs, policy, env):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, dtype, filename = weight_specs[i]
-
+        # todo what is pin_memory?
         if len(shape) < 2:
             pin_memory = True
             compress = False
@@ -184,6 +184,13 @@ class InputEmbed:
         self.task = task
 
     def init_weight(self, weight_home, path):
+        """
+        The init_weight method initializes the weight information and stores it in the weight_home attribute.
+        It creates a list of weight_specs which define the shape, data type, and file name of each weight.
+        The list has two elements for w_token and w_pos, which represent the weights for the input tokens and the input positions.
+        @param weight_home:
+        @param path:
+        """
         v, h, s, dtype = (self.config.vocab_size, self.config.input_dim,
             self.config.max_seq_len, self.config.dtype)
         path = os.path.join(path, "")
@@ -195,9 +202,20 @@ class InputEmbed:
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
+        # The purpose of having the weight_home attribute is to keep the weights in memory on a specific device, rather than having them moving back and forth between devices.
+        # This can improve the performance of the model since moving data between devices can be expensive and can cause delays during training.
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
+        """
+        weight_read_buf is the buffer used to read weights from weight_home. Since the weights are kept on a specific device, they need to be read into all the GPU devices used for parallel training.
+        This is done by first copying the weights on the CPU node or storage, followed by copying them onto weight_read_buf, which is accessed by the parallel GPUs.
+        weight_write_buf, on the other hand, is used to write the weights that are updated during the forward or backward pass of each GPU during parallel training.
+        The write buffer stores the newly computed weights from each GPU and is merged by the DeviceTensorList method after the forward or backward pass from each GPU.
+
+        In summary, while weight_home holds the weights on a specific device, weight_read_buf and weight_write_buf hold the weights for parallel training by different GPUs,
+        with weight_read_buf reading the weights into GPU devices and weight_write_buf writing newly updated weights after each parallelized training process iteration.
+        """
         w_token, w_pos = weight_home.val
         if k == 0:
             dst = self.weight_load_dst
@@ -225,14 +243,21 @@ class InputEmbed:
         # Compute input embedding
         donate = [False] * 4
         h, donate[0] = hidden.val, True
+        # it gets the attention mask mask from attention_mask and copies it to self.compute using smart_copy().
+        # It also extracts the weights w_token and w_pos from weight_read_buf.
         mask, donate[1] = attention_mask.val.smart_copy(self.compute)
 
+        # If k is equal to self.policy.num_gpu_batches - 1, it means that this is the last GPU batch, and so the function pops the weights from weight_read_buf.
+        # Otherwise, it gets the weights from weight_read_buf.val.
+        # why there is the operation of poping? Because of zig-zag policy, we are turning to next layer, so we need to load weight again.
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
         else:
             (w_token, _), (w_pos, _) = weight_read_buf.val
 
+        # Finally, it calls self.compute.opt_input_embed() to calculate the input embeddings. This method takes the hidden state h, the attention mask mask, the weights w_token and w_pos, and the padding token ID self.config.pad_token_id as inputs.
+        # It also takes donate as another input argument to indicate whether to donate memory. The resulting input embeddings are stored in hidden.val.
         h = self.compute.opt_input_embed(h, mask,
             w_token, w_pos, self.config.pad_token_id, donate)
         hidden.val = h
@@ -362,6 +387,11 @@ class SelfAttention:
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
+        # The function first checks the cache_gpu_percent, cache_cpu_percent, and cache_disk_percent properties of self.policy.
+        # Depending on the value of these properties, the function assigns a device object to a particular device (either GPU, CPU, disk, or mixed).
+        # After determining the device, the function checks if self.policy.compress_cache is set to True.
+        # If so, it ensures that the device is not a mixed device since compression is not supported on mixed devices.
+        # If necessary, the function updates the device to the compressed device.
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
@@ -375,6 +405,8 @@ class SelfAttention:
             assert device.device_type != DeviceType.MIXED
             device = device.compressed_device
         # TorchTensor.
+        # Finally, the function calls the init_cache_one_gpu_batch method of device with three arguments (self.config, self.task, self.policy) to create a cache.
+        # This cache is then stored in cache_home using the store method.
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
 
@@ -717,7 +749,7 @@ class OptLM:
         self.execute_gen_len = gen_len
 
         self.enable_tidy_profiling = True
-        # todo I don't know whether device is set to a right value
+        #
         # self.device = self.comm_device
 
         # It is a mechanism that allows for asynchronous execution and synchronization of CUDA streams.
@@ -834,25 +866,25 @@ class OptLM:
         load_weight_slot = self.load_weight_start_events[i][j][k].elapsed_time(self.load_weight_ready_events[i][j][k]) * 1e+3
         load_weight_log = {"name": "load_weight", "ph": "X", "pid": 0, "tid": "1. load-weight",
                      "dur": load_weight_slot,"ts": self.get_ts(self.load_weight_start_events[i][j][k]),
-                     "args": {"gen-len": i,"num_layers": j,"num-gpu": k}, "cname": "thread_state_iowait"}
+                     "args": {"gen-len-id": i,"layers-id": j,"gpu-id": k}, "cname": "good"}
         self.profiling_log.append(load_weight_log)
 
     def profiling_load_cache_stage(self,i , j , k):
         torch.cuda.synchronize()
 
         load_cache_slot = self.load_cache_start_events[i][j][k].elapsed_time(self.load_cache_ready_events[i][j][k]) * 1e+3
-        load_cache_log = {"name": "load_cache", "ph": "X", "pid": 0, "tid": "2. load-cache",
+        load_cache_log = {"name": "load_cache", "ph": "X", "pid": 0, "tid": "6. load-cache",
                      "dur": load_cache_slot,"ts": self.get_ts(self.load_cache_start_events[i][j][k]),
-                     "args": {"gen-len": i,"num_layers": j,"num-gpu": k}, "cname": "thread_state_iowait"}
+                     "args": {"gen-len-id": i,"layers-id": j,"gpu-id": k}, "cname": "cq_build_running"}
         self.profiling_log.append(load_cache_log)
 
     def profiling_load_hidden_stage(self,i , j , k):
         torch.cuda.synchronize()
 
         load_hidden_slot = self.load_hidden_start_events[i][j][k].elapsed_time(self.load_hidden_ready_events[i][j][k]) * 1e+3
-        load_hidden_log = {"name": "load_hidden", "ph": "X", "pid": 0, "tid": "3. load-hidden",
+        load_hidden_log = {"name": "load_hidden", "ph": "X", "pid": 0, "tid": "2. load-hidden",
                      "dur": load_hidden_slot,"ts": self.get_ts(self.load_hidden_start_events[i][j][k]),
-                     "args": {"gen-len": i,"num_layers": j,"num-gpu": k}, "cname": "thread_state_iowait"}
+                     "args": {"gen-len-id": i,"layers-id": j,"gpu-id": k}, "cname": "rail_response"}
 
         self.profiling_log.append(load_hidden_log)
 
@@ -861,9 +893,9 @@ class OptLM:
         torch.cuda.synchronize()
 
         compute_slot = self.compute_start_events[i][j][k].elapsed_time(self.compute_ready_events[i][j][k]) * 1e+3
-        compute_log = {"name": "compute", "ph": "X", "pid": 0, "tid": "4. compute",
+        compute_log = {"name": "compute", "ph": "X", "pid": 0, "tid": "3. compute",
                      "dur": compute_slot,"ts": self.get_ts(self.compute_start_events[i][j][k]),
-                     "args": {"gen-len": i,"num_layers": j,"num-gpu": k}, "cname": "thread_state_compute"}
+                     "args": {"gen-len-id": i,"layers-id": j,"gpu-id": k}, "cname": "black"}
 
         self.profiling_log.append(compute_log)
 
@@ -872,9 +904,9 @@ class OptLM:
 
         store_hidden_slot = self.store_hidden_start_events[i][j][k].elapsed_time(
             self.store_hidden_ready_events[i][j][k]) * 1e+3
-        store_hidden_log = {"name": "store_hidden", "ph": "X", "pid": 0, "tid": "5. store-hidden",
+        store_hidden_log = {"name": "store_hidden", "ph": "X", "pid": 0, "tid": "4. store-hidden",
                            "dur": store_hidden_slot, "ts": self.get_ts(self.store_hidden_start_events[i][j][k]),
-                           "args": {"gen-len": i, "num_layers": j, "num-gpu": k}, "cname": "thread_state_iowait"}
+                           "args": {"gen-len-id": i, "layers-id": j, "gpu-id": k}, "cname": "rail_response"}
 
         self.profiling_log.append(store_hidden_log)
 
@@ -882,9 +914,9 @@ class OptLM:
         torch.cuda.synchronize()
 
         store_cache_slot = self.store_cache_start_events[i][j][k].elapsed_time(self.store_cache_ready_events[i][j][k]) * 1e+3
-        store_cache_log = {"name": "store_cache", "ph": "X", "pid": 0, "tid": "6. store-cache",
+        store_cache_log = {"name": "store_cache", "ph": "X", "pid": 0, "tid": "5. store-cache",
                      "dur": store_cache_slot,"ts": self.get_ts(self.store_cache_start_events[i][j][k]),
-                     "args": {"gen-len": i,"num_layers": j,"num-gpu": k}, "cname": "thread_state_iowait"}
+                     "args": {"gen-len-id": i,"layers-id": j,"gpu-id": k}, "cname": "cq_build_running"}
         self.profiling_log.append(store_cache_log)
 
 
@@ -1059,6 +1091,8 @@ class OptLM:
         # Load to hidden states buffers
         # the function loads the hidden states from previous iterations into the model's compute buffer.
         # If j is 0, then the hidden state is loaded from either the input ids (if i is 0) or the last generated token (if i is not 0).
+        self.profile_mark_load_hidden_start(i, j, k)
+
         dst = self.layers[j].compute
         if j == 0:
             gpu_batch_size = self.policy.gpu_batch_size
@@ -1073,7 +1107,7 @@ class OptLM:
         else:  # load from the last layer
             val = self.hidden[i][j-1][k].pop().move(dst)
 
-        self.profile_mark_load_hidden_start(i,j,k)
+
         self.hidden[i][j][k].store(val)
         self.profile_mark_load_hidden_end(i,j,k)
         self.profiling_load_hidden_stage(i,j,k)

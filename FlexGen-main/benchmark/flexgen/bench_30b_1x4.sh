@@ -12,7 +12,7 @@ N_GPUS=4
 N_CORES_PER_GPU=12
 
 PYTHON_EXEC=$CONDA_PREFIX/bin/python
-PYTHON_SCRIPT=profile.dist_flex_opt_profile
+PYTHON_SCRIPT=prefill.dist_flex_opt_profile
 
 pgrep -fl python | awk '!/dist_flex_opt\.py/{print $1}' | xargs sudo kill
 
@@ -31,7 +31,7 @@ mpirun --allow-run-as-root\
     --use-mpi \
     --model facebook/opt-30b \
     --gpu-batch-size 12 \
-    --num-gpu-batches 3\
+    --num-gpu-batches 4\
     --percent 20 80 0 100 0 100 \
     --comm-device cpu \
     --compress-weight \
@@ -41,7 +41,7 @@ mpirun --allow-run-as-root\
     --cpu
 
 $PYTHON_EXEC merge_trace_file.py \
-  --num-gpu-batches 3\
+  --num-gpu-batches 4 \
   --model facebook/opt-30b \
   --overlap True\
   --compress-weight True\

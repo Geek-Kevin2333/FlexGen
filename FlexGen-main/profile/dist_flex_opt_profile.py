@@ -71,6 +71,7 @@ class DistOptLM(OptLM):
         self.policy = policy
         self.num_gpu_batches = self.policy.num_gpu_batches
         self.pipeline_rank = pipeline_rank
+        # todo double check these equations
         self.pp_rank=pipeline_rank
         self.pipeline_group_size = num_pipeline_stages
         self.num_pipeline_stages = num_pipeline_stages
@@ -140,8 +141,9 @@ class DistOptLM(OptLM):
         self.init_time_stamp = None
         self.init_time_stamp = time.time() * 1e+6
         self.dtype=np.float16
-        self.micro_batch_num = num_inner_iterations
-        self.micro_batch_size = self.policy.gpu_batch_size
+        # todo fix the bug
+        self.micro_batch_num = self.num_pipeline_batches//self.num_inner_iterations
+        self.micro_batch_size = self.num_inner_iterations
         self.enable_tidy_profiling = True
         # todo I don't know whether device is set to a right value
         self.device = self.comm_device
@@ -153,7 +155,7 @@ class DistOptLM(OptLM):
         # enable_timing (bool): If True, the event will record a timestamp when the event is reached.
         # blocking (bool): If True, a call to record() or synchronize() is a blocking operation that will wait for the event to complete. If False, the call to record() or synchronize() will return immediately, and the event will be completed asynchronously in the background.
 
-        # [micro_batch_num,num_gpu_batch]
+        # [num_inner_iterations,execute_gen_len,num_layers,num_gpu_batches]
         self.compute_start_events = [[[[torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
                                             for _ in range(self.num_gpu_batches)]
                                            for _ in range(self.num_layers)] for _ in range(self.execute_gen_len)]
@@ -163,7 +165,29 @@ class DistOptLM(OptLM):
                                             for _ in range(self.num_gpu_batches)]
                                            for _ in range(self.num_layers)] for _ in range(self.execute_gen_len)]
                                          for _ in range(self.num_inner_iterations)]
-        # [micro_batch_num,num_gpu_batch]
+        self.sending_future_t_i_j_k=[]
+        self.receiving_future_t_i_j_k=[]
+        self.send_start_events = [[[[torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
+                                            for _ in range(self.num_gpu_batches)]
+                                           for _ in range(self.num_layers)] for _ in range(self.execute_gen_len)]
+                                         for _ in range(self.num_inner_iterations)]
+
+        self.send_ready_events = [[[[torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
+                                            for _ in range(self.num_gpu_batches)]
+                                           for _ in range(self.num_layers)] for _ in range(self.execute_gen_len)]
+                                         for _ in range(self.num_inner_iterations)]
+
+        self.receive_start_events = [[[[torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
+                                            for _ in range(self.num_gpu_batches)]
+                                           for _ in range(self.num_layers)] for _ in range(self.execute_gen_len)]
+                                         for _ in range(self.num_inner_iterations)]
+
+        self.receive_ready_events = [[[[torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
+                                            for _ in range(self.num_gpu_batches)]
+                                           for _ in range(self.num_layers)] for _ in range(self.execute_gen_len)]
+                                         for _ in range(self.num_inner_iterations)]
+
+        #
         self.load_cache_ready_events = [[[[torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
                                             for _ in range(self.num_gpu_batches)]
                                            for _ in range(self.num_layers)] for _ in range(self.execute_gen_len)]
@@ -242,6 +266,20 @@ class DistOptLM(OptLM):
     def profile_mark_compute_end(self, t,i,j, k):
         # print("record micro_batch"+str(t)+" gpu "+str(k)+"load_cache_start")
         torch.cuda.current_stream().record_event(self.compute_ready_events[t][i][j][k])
+
+    def profile_mark_send_start(self, t,i,j, k):
+        torch.cuda.current_stream().record_event(self.send_start_events[t][i][j][k])
+
+    def profile_mark_send_ready(self, t, i, j, k):
+        torch.cuda.current_stream().record_event(self.send_ready_events[t][i][j][k])
+
+    def profile_mark_receive_start(self, t, i, j, k):
+        torch.cuda.current_stream().record_event(self.receive_start_events[t][i][j][k])
+
+    def profile_mark_receive_ready(self, t, i, j, k):
+        torch.cuda.current_stream().record_event(self.receive_ready_events[t][i][j][k])
+
+
 
     def profile_mark_load_weight_start(self,b, t,i,j, k):
         # print("record micro_batch"+str(t)+" gpu "+str(k)+"load_cache_start")
@@ -452,6 +490,7 @@ class DistOptLM(OptLM):
     # The goal is to send tensor values from a previous stage (sender rank) to the next stage (receiver rank),
     # a process known as inter-stage communication.
     def send_hidden(self, t, i, j, k, tag=0, async_=False):
+        self.profile_mark_send_start(t,i,j,k)
         # Suppose we need to send tensors on GPUs
         x = self.hidden[t][i][j][k]
         # Firstly, the tensor is moved to the communication device (self.comm_device). This is because GPU tensors cannot be directly transmitted between different GPU ranks in PyTorch,
@@ -461,11 +500,18 @@ class DistOptLM(OptLM):
         receiver_rank = (self.pipeline_rank + 1) % self.num_pipeline_stages
         if async_:
             future = dist.isend(val.data, receiver_rank, tag=tag)
+            # self.profile_mark_send_ready(t,i,j,k)
+            # self.profiling_send_stage(t,i,j,k)
+            self.sending_future_t_i_j_k.append([t,i,j,k])
             return future
         else:
             dist.send(val.data, receiver_rank, tag=tag)
+            self.profile_mark_send_ready(t,i,j,k)
+            self.profiling_send_stage(t,i,j,k)
+
 
     def recv_hidden(self, t, i, j, k, tag=0, async_=False):
+        self.profile_mark_receive_start(t,i,j,k)
         sender_rank = (self.pipeline_rank - 1) % self.num_pipeline_stages
         val_holder = self.hidden[t][i][j][k]
         seq_len = self.task.prompt_len if i == 0 else 1
@@ -482,19 +528,26 @@ class DistOptLM(OptLM):
         if async_:
             # The method returns a future object that is completed once the message has been received.
             future = dist.irecv(val_holder.val.data, sender_rank, tag=tag)
+            self.receiving_future_t_i_j_k.append([t,i,j,k])
             return future, move_value_callback
         else:
             dist.recv(val_holder.val.data, sender_rank, tag=tag)
             move_value_callback()
+            self.profile_mark_receive_ready(t, i, j, k)
+            self.profiling_receive_stage(t, i, j, k)
 
     def compute_layer(self, t, i, j, k):
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
+        self.profile_mark_compute_start(t,i,j,k)
         self.layers[j].forward(self.hidden[t][i][j][k], self.cache_read_buf[t][j][k],
             self.weight_read_buf[j], self.attention_mask[t][k],
             self.cache_write_buf[t][j][k], i, k)
+        self.profile_mark_compute_end(t,i,j,k)
+        self.profiling_compute_stage(t,i,j,k)
+
 
     def update_attention_mask(self, b, t, i, k):
         """
@@ -616,7 +669,7 @@ class DistOptLM(OptLM):
         dist.barrier()
 
         # Generate
-        # todo prefill
+
         self.profiling_log = []
         if not overlap:
             # No overlap
@@ -656,8 +709,8 @@ class DistOptLM(OptLM):
         The method takes two arguments, sending_job and receiving_job. Both arguments are tuples with two elements.
         The first element is the tensor that will be sent or received. The second element is an integer indicating the index of the tensor in a larger sequence of tensors.
         If a job is not provided, then the corresponding variables st, si, rt, ri are set to None.
-        @param sending_job:
-        @param receiving_job:
+        t stands for the index of inner_iterations
+        i stands for the index of generated token
         @return:
         """
         st, si = sending_job if sending_job is not None else (None, None)
@@ -670,6 +723,7 @@ class DistOptLM(OptLM):
 
         def _send():
             sending_futures = []
+
             if not sending:
                 return sending_futures
             for k in range(self.num_gpu_batches):
@@ -683,6 +737,7 @@ class DistOptLM(OptLM):
             if not receiving:
                 return receiving_futures
             for k in range(self.num_gpu_batches):
+
                 receiving_future = self.recv_hidden(rt, ri, 0, k, self.receiving_tag, async_=self.async_comm)
                 receiving_futures.append(receiving_future)
                 self.receiving_tag += 1
@@ -691,10 +746,13 @@ class DistOptLM(OptLM):
         # The order of sending and receiving is carefully structured to prevent deadlock.
         # If the self.pipeline_rank is 0, then the nodes receive first and send next. Otherwise, they send first and then receive.
         # Use special order below to avoid deadlock
+
+
         if self.pipeline_rank == 0:
             # Receive first and then send
             receiving_futures = _recv()
             sending_futures = _send()
+
         else:
             # Send first and then receive
             sending_futures = _send()
@@ -703,12 +761,22 @@ class DistOptLM(OptLM):
         # If the communication is asynchronous,
         # it also waits for the futures to complete and triggers the specified callback functions when the receive call finishes.
         if self.async_comm:
+            sending_index = 0
+            receiving_index = 0
             for sending_future in sending_futures:
                 sending_future.wait()
+                t_i_j_k_item=self.sending_future_t_i_j_k[sending_index]
+                self.profile_mark_send_ready(t_i_j_k_item[0],t_i_j_k_item[1],t_i_j_k_item[2],t_i_j_k_item[3])
+                self.profiling_send_stage(t_i_j_k_item[0],t_i_j_k_item[1],t_i_j_k_item[2],t_i_j_k_item[3])
+                sending_index+=1
+
             for receiving_future, callback in receiving_futures:
                 receiving_future.wait()
                 callback()
-
+                t_i_j_k_item=self.receiving_future_t_i_j_k[receiving_index]
+                self.profile_mark_receive_ready(t_i_j_k_item[0],t_i_j_k_item[1],t_i_j_k_item[2],t_i_j_k_item[3])
+                self.profiling_receive_stage(t_i_j_k_item[0],t_i_j_k_item[1],t_i_j_k_item[2],t_i_j_k_item[3])
+                receiving_index+=1
 
 
     def generation_loop_normal(self):
@@ -771,10 +839,9 @@ class DistOptLM(OptLM):
                             self.sync()
                             # It computes the output of the layer using compute_layer(), and synchronizes the processes.
                            # self.torch_comp_stream.wait_event(self.load_cache_ready_events[k])
-                            self.profile_mark_compute_start(t,i,j,k)
+
                             self.compute_layer(t, i, j, k)
-                            self.profile_mark_compute_end(t,i,j,k)
-                            self.profiling_compute_stage(t,i,j,k)
+
                             #self.torch_comp_stream.record_event(self.forward_comp_ready_events[k])
                             self.sync()
                             # It stores the updated hidden states and cache using store_hidden() and store_cache(), respectively, and synchronizes the processes.
@@ -802,46 +869,67 @@ class DistOptLM(OptLM):
         torch.cuda.synchronize()
 
         load_weight_slot = self.load_weight_start_events[b][t][i][j][k].elapsed_time(self.load_weight_ready_events[b][t][i][j][k]) * 1e+3
-        load_weight_log = {"name": "load_weight", "ph": "X", "pid": self.pp_rank, "tid": "1. load-weight",
+        load_weight_log = {"name": "load_weight", "ph": "X", "pid": self.pp_rank, "tid": "load-weight",
                      "dur": load_weight_slot,"ts": self.get_ts(self.load_weight_start_events[b][t][i][j][k]),
-                     "args": {"micro-batch-index": b,"inner-iteration-index":t,"generate-token-index":i,"layer-index":j, "num-gpu-batch":k}, "cname": "thread_state_iowait"}
+                     "args": {"micro-batch-index": b,"inner-micro-batch-index":t,"generate-token-index":i,"layer-index":j, "gpu-index":k}, "cname": "good"}
         self.profiling_log.append(load_weight_log)
 
     def profiling_load_cache_stage(self,t,i,j,k):
         torch.cuda.synchronize()
 
         load_cache_slot = self.load_cache_start_events[t][i][j][k].elapsed_time(self.load_cache_ready_events[t][i][j][k]) * 1e+3
-        load_cache_log = {"name": "load_cache", "ph": "X", "pid": self.pp_rank, "tid": "2. load-cache",
+        load_cache_log = {"name": "load_cache", "ph": "X", "pid": self.pp_rank, "tid": "load-cache",
                      "dur": load_cache_slot,"ts": self.get_ts(self.load_cache_start_events[t][i][j][k]),
-                     "args": {"inner-iteration-index":t,"generate-token-index":i,"layer-index":j, "num-gpu-batch":k}, "cname": "thread_state_iowait"}
+                     "args": {"inner-micro-batch-index":t,"generate-token-index":i,"layer-index":j, "gpu-index":k}, "cname": "cq_build_running"}
         self.profiling_log.append(load_cache_log)
 
     def profiling_store_cache_stage(self,t, i, j, k):
         torch.cuda.synchronize()
 
         store_cache_slot = self.store_cache_start_events[t][i][j][k].elapsed_time(self.store_cache_ready_events[t][i][j][k]) * 1e+3
-        store_cache_log = {"name": "store_cache", "ph": "X", "pid": self.pp_rank, "tid": "6. store-cache",
+        store_cache_log = {"name": "store_cache", "ph": "X", "pid": self.pp_rank, "tid": "store-cache",
                      "dur": store_cache_slot,"ts": self.get_ts(self.store_cache_start_events[t][i][j][k]),
-                     "args": {"inner-iteration-index":t,"generate-token-index":i,"layer-index":j, "num-gpu-batch":k}, "cname": "thread_state_iowait"}
+                     "args": {"inner-micro-batch-index":t,"generate-token-index":i,"layer-index":j, "gpu-index":k}, "cname": "cq_build_running"}
         self.profiling_log.append(store_cache_log)
 
     def profiling_compute_stage(self,t,i,j,k):
         torch.cuda.synchronize()
 
         compute_slot = self.compute_start_events[t][i][j][k].elapsed_time(self.compute_ready_events[t][i][j][k]) * 1e+3
-        compute_log = {"name": "compute", "ph": "X", "pid": self.pp_rank, "tid": "4. compute",
+        compute_log = {"name": "compute", "ph": "X", "pid": self.pp_rank, "tid": "compute",
                      "dur": compute_slot,"ts": self.get_ts(self.compute_start_events[t][i][j][k]),
-                     "args": {"inner-iteration-index":t,"generate-token-index":i,"layer-index":j, "num-gpu-batch":k}, "cname": "thread_state_iowait"}
+                     "args": {"inner-micro-batch-index":t,"generate-token-index":i,"layer-index":j, "gpu-index":k}, "cname": "black"}
 
         self.profiling_log.append(compute_log)
+
+    def profiling_send_stage(self,t,i,j,k):
+        torch.cuda.synchronize()
+
+        send_slot = self.send_start_events[t][i][j][k].elapsed_time(self.send_ready_events[t][i][j][k]) * 1e+3
+        send_log = {"name": "send", "ph": "X", "pid": self.pp_rank, "tid": "send",
+                     "dur": send_slot,"ts": self.get_ts(self.send_start_events[t][i][j][k]),
+                     "args": {"inner-micro-batch-index":t,"generate-token-index":i,"layer-index":j, "gpu-index":k}, "cname": "olive"}
+
+        self.profiling_log.append(send_log)
+
+    def profiling_receive_stage(self,t,i,j,k):
+        torch.cuda.synchronize()
+
+        receive_slot = self.receive_start_events[t][i][j][k].elapsed_time(self.receive_ready_events[t][i][j][k]) * 1e+3
+        receive_log = {"name": "receive", "ph": "X", "pid": self.pp_rank, "tid": "receive",
+                     "dur": receive_slot,"ts": self.get_ts(self.receive_start_events[t][i][j][k]),
+                     "args": {"inner-micro-batch-index":t,"generate-token-index":i,"layer-index":j, "gpu-index":k}, "cname": "olive"}
+
+        self.profiling_log.append(receive_log)
+
 
     def profiling_load_hidden_stage(self,b, t, i, j, k):
         torch.cuda.synchronize()
 
         slot = self.load_hidden_start_events[b][t][i][j][k].elapsed_time(self.load_hidden_ready_events[b][t][i][j][k]) * 1e+3
-        log = {"name": "load-hidden", "ph": "X", "pid": self.pp_rank, "tid": "3. load-hidden",
+        log = {"name": "load-hidden", "ph": "X", "pid": self.pp_rank, "tid": "load-hidden",
                        "dur": slot, "ts": self.get_ts(self.load_hidden_start_events[b][t][i][j][k]),
-                       "args": {"micro-batch-index": b,"inner-iteration-index":t,"generate-token-index":i,"layer-index":j, "num-gpu-batch":k}, "cname": "thread_state_iowait"}
+                       "args": {"micro-batch-index": b,"inner-micro-batch-index":t,"generate-token-index":i,"layer-index":j, "gpu-index":k}, "cname": "rail_response"}
 
         self.profiling_log.append(log)
 
@@ -850,10 +938,10 @@ class DistOptLM(OptLM):
 
         slot = self.store_hidden_start_events[b][t][i][j][k].elapsed_time(
             self.store_hidden_ready_events[b][t][i][j][k]) * 1e+3
-        log = {"name": "store-hidden", "ph": "X", "pid": self.pp_rank, "tid": "5. store-hidden",
+        log = {"name": "store-hidden", "ph": "X", "pid": self.pp_rank, "tid": "store-hidden",
                "dur": slot, "ts": self.get_ts(self.load_hidden_start_events[b][t][i][j][k]),
-               "args": {"micro-batch-index": b, "inner-iteration-index": t, "generate-token-index": i, "layer-index": j,
-                        "num-gpu-batch": k}, "cname": "thread_state_iowait"}
+               "args": {"micro-batch-index": b, "inner-micro-batch-index": t, "generate-token-index": i, "layer-index": j,
+                        "gpu-index": k}, "cname": "rail_response"}
 
         self.profiling_log.append(log)
 
@@ -892,10 +980,9 @@ class DistOptLM(OptLM):
 
                         self.load_hidden(b, t, i, j, 0)
 
-                        self.profile_mark_compute_start(t,i,j,0)
+
                         self.compute_layer(t, i, j, 0)
-                        self.profile_mark_compute_end(t,i,j,0)
-                        self.profiling_compute_stage(t,i,j,0)
+
 
 
                         self.store_cache(t, i, j-1, 0)
@@ -917,9 +1004,15 @@ class DistOptLM(OptLM):
         self.receiving_tag = 0
         last_sending_job = None
 
+        print("num_pipeline_batches in multi_batch")
+        print(self.num_pipeline_batches)
+        print("num_inner_iterations in multi_batch")
+        print(self.num_inner_iterations)
+        # prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, 0, 0, k)
-
+        # num_pipeline_batches // num_inner_iterations refers to the effective batch size used for updating the optimizer parameters in pipeline parallelism when using an iterative optimization algorithm such as stochastic gradient descent (SGD). It is computed by dividing the number of pipeline batches by the number of inner iterations.
+        # For example, if num_pipeline_batches is set to 16 and num_inner_iterations is set to 4, the effective batch size for each update is 16 // 4 = 4. This means that the optimizer parameters are updated every 4 mini-batches, with each update using an effective batch size of 4.
         for b in range(self.num_pipeline_batches // self.num_inner_iterations):
             for i in range(self.execute_gen_len):
                 for t in range(self.num_inner_iterations):
@@ -935,23 +1028,10 @@ class DistOptLM(OptLM):
                         for k in range(self.num_gpu_batches):
 
                             self.load_weight(b, t, i, j + 1, k)
-
-
-
                             self.load_cache(t, i, j, k + 1)
-
-
                             self.load_hidden(b, t, i, j, k)
-
-                            self.profile_mark_compute_start(t,i,j,k)
                             self.compute_layer(t, i, j, k)
-                            self.profile_mark_compute_end(t,i,j,k)
-                            self.profiling_compute_stage(t,i,j,k)
-
-
                             self.store_cache(t, i, j, k - 1)
-
-
                             self.store_hidden(b, t, i, j, k)
                             self.sync()
 

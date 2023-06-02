@@ -564,8 +564,15 @@ class DistOptLM(OptLM):
         self.receiving_tag = 0
         last_sending_job = None
 
+        print("num_pipeline_batches in multi_batch")
+        print(self.num_pipeline_batches)
+        print("num_inner_iterations in multi_batch")
+        print(self.num_inner_iterations)
+
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, 0, 0, k)
+
+
 
         for b in range(self.num_pipeline_batches // self.num_inner_iterations):
             for i in range(self.execute_gen_len):

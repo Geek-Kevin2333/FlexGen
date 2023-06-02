@@ -499,6 +499,7 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
         # (batch_size,sequence_length,hidden_size)
         b, s, h = inputs.shape
+
         head_dim = h // n_head
         scaling = head_dim ** -0.5
         # Then the input vector sequence is normalized using layer norm.
@@ -606,6 +607,7 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
+
         src_s = attention_mask.shape[1]
         head_dim = h // n_head
         scaling = head_dim ** -0.5
