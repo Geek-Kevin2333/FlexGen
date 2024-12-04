@@ -1667,6 +1667,7 @@ def run_flexgen(args):
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
+
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()

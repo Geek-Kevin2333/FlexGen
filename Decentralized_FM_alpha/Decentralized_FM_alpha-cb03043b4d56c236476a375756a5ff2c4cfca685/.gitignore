@@ -1,0 +1,12 @@
+/binhang_ds3_aws_oregon.pem
+/scripts/tc_scripts/heterogeneous_setup_case*.sh
+/task_datasets/data/*
+.ipynb_checkpoints
+__pycache__
+trace_json
+/us_coordinator.pem
+/vs_code.config
+tmp_executable_1/*
+tmp_executable_64/*
+unit_tests/tmp_executable_1/*
+unit_tests/tmp_executable_64/*
